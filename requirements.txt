@@ -4,3 +4,6 @@ numpy
 openpyxl
 xlsxwriter
 plotly
+statsmodels
+sqlalchemy
+pyarrow

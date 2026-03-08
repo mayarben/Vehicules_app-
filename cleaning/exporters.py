@@ -1,13 +1,98 @@
+# cleaning/exporters.py
 from __future__ import annotations
 
 from io import BytesIO
 import re
 import unicodedata
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import xlsxwriter
+
+
+# ======================================================
+# Text / header normalization (mojibake-safe)
+# ======================================================
+def _strip_accents_txt(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = s.replace("\u00A0", " ").replace("\u202F", " ").strip()
+    # common mojibake repairs seen in your files
+    s = s.replace("VÃ©hicule", "Véhicule").replace("vÃ©hicule", "véhicule")
+    s = s.replace("DÃ©signation", "Désignation").replace("dÃ©signation", "désignation")
+    s = s.replace("PiÃ¨ce", "Pièce").replace("piÃ¨ce", "pièce")
+    s = s.replace("QtÃ©", "Qté").replace("qtÃ©", "qté")
+    s = s.replace("NÂ°", "N°").replace("nÂ°", "n°")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.lower()
+
+
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\u00A0", " ", regex=False)
+        .str.replace("\u202F", " ", regex=False)
+        .str.replace("\xa0", " ", regex=False)
+        .str.strip()
+        .str.replace("\n", " ", regex=False)
+        .str.replace("\r", " ", regex=False)
+    )
+    return df
+
+
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """
+    Picks a column by:
+    - exact match on normalized key
+    - or contains match on normalized key
+    """
+    if df is None or df.empty:
+        return None
+
+    cols_norm = {_strip_accents_txt(c): c for c in df.columns}
+    cand_norm = [_strip_accents_txt(x) for x in candidates]
+
+    # exact normalized match
+    for cn in cand_norm:
+        if cn in cols_norm:
+            return cols_norm[cn]
+
+    # contains normalized match
+    for k_norm, orig in cols_norm.items():
+        if any(cn in k_norm for cn in cand_norm):
+            return orig
+
+    return None
+
+
+def _force_vehicle_col(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Find any column that looks like vehicle/vehicule/véhicule (even mojibake),
+    rename it to 'Véhicule'. Returns (df, 'Véhicule') or (df, None).
+    """
+    if df is None or df.empty:
+        return df, None
+
+    for c in df.columns:
+        nc = _strip_accents_txt(c)
+        if ("vehicul" in nc) or ("vehicle" in nc) or ("immat" in nc) or ("immatric" in nc) or ("matricule" in nc):
+            df = df.rename(columns={c: "Véhicule"})
+            return df, "Véhicule"
+    return df, None
+
+
+def _force_designation_col(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
+    if df is None or df.empty:
+        return df, None
+    for c in df.columns:
+        nc = _strip_accents_txt(c)
+        if "designation" in nc or "design" in nc or "libelle" in nc or "libell" in nc:
+            df = df.rename(columns={c: "Designation"})
+            return df, "Designation"
+    return df, None
 
 
 # ======================================================
@@ -27,41 +112,12 @@ def _san(v):
 
 
 # ======================================================
-# Column normalization + picking
-# ======================================================
-def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = (
-        df.columns.astype(str)
-        .str.replace("\u00A0", " ", regex=False)   # NBSP -> space
-        .str.strip()
-        .str.replace("\n", " ", regex=False)
-        .str.replace("\r", " ", regex=False)
-    )
-    return df
-
-
-def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = {str(c).lower().strip(): c for c in df.columns}
-    for cand in candidates:
-        k = cand.lower().strip()
-        if k in cols:
-            return cols[k]
-    return None
-
-
-# ======================================================
 # Numeric cleaning
 # ======================================================
 def clean_numeric(series: pd.Series) -> pd.Series:
-    """
-    Handles:
-    - "1 234,567" -> 1234.567
-    - "1234,567"  -> 1234.567
-    - "1234.567"  -> 1234.567
-    """
     s = series.astype(str)
     s = s.str.replace("\u00A0", " ", regex=False)
+    s = s.str.replace("\u202F", " ", regex=False)
     s = s.str.replace("\xa0", " ", regex=False)
     s = s.str.replace(" ", "", regex=False)
     s = s.str.replace(",", ".", regex=False)
@@ -87,39 +143,34 @@ def normalize_vehicle_id(value) -> str:
     if s == "":
         return ""
 
-    # 356771.0 -> 356771
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
 
     s = re.sub(r"\s+", "", s)
 
-    # already correct: 17-XXXXXX (6 digits)
     if re.fullmatch(r"17-\d{6}", s):
         return s
 
-    # match 17xxxxxx or 17-xxxxxx
     m = re.search(r"17-?(\d{6})", s)
     if m:
         return f"17-{m.group(1)}"
 
-    # digits only
     if s.isdigit():
         if s.startswith("17") and len(s) >= 8:
-            return f"17-{s[-6:]}"          # 17351426 -> 17-351426
-        return f"17-{s.zfill(6)[-6:]}"     # 351304 -> 17-351304
+            return f"17-{s[-6:]}"
+        return f"17-{s.zfill(6)[-6:]}"
 
     return s
 
 
 def fix_vehicle(v):
-    """More permissive fixer used in your merge scripts (7-xxxxx -> 17-xxxxx, etc.)."""
     if pd.isna(v):
         return np.nan
     s = str(v).strip()
 
     if s.endswith(".0"):
         s = s[:-2]
-    s = s.replace("\u00A0", "").replace("\xa0", "").replace(" ", "")
+    s = s.replace("\u00A0", "").replace("\u202F", "").replace("\xa0", "").replace(" ", "")
 
     if s.startswith("17-") and s[3:].isdigit():
         return s
@@ -132,19 +183,19 @@ def fix_vehicle(v):
         return "17-" + s[2:]
 
     if s.isdigit():
-        return "17-" + s
+        return "17-" + s.zfill(6)[-6:]
 
     return np.nan
 
 
 # ======================================================
-# Text normalization for designation KPI + decompte parsing
+# Text normalization for parsing
 # ======================================================
 def norm_text(s: str) -> str:
     if s is None:
         return ""
-    s = str(s).replace("\u00a0", " ").strip().lower()
-    s = s.replace("œ", "oe").replace("’", "'")
+    s = str(s).replace("\u00a0", " ").replace("\u202f", " ").strip().lower()
+    s = s.replace("Å“", "oe").replace("â€™", "'")
     s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
     s = re.sub(r"\s+", " ", s)
     return s
@@ -155,82 +206,100 @@ def clean_designation_for_kpi(x) -> Optional[str]:
         return None
     s = str(x).strip().lower()
     s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
-    s = re.sub(r"\s+", " ", s)
-    s = s.strip()
+    s = re.sub(r"\s+", " ", s).strip()
     return s if s else None
 
 
 # ======================================================
-# Enforce schema / types (display rules)
+# Enforce schema / types (robust)
 # ======================================================
 def enforce_schema(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
 
-    col_doss = pick_col(df, ["N° Doss", "N°Doss", "No Doss", "N Doss"])
-    col_veh  = pick_col(df, ["Véhicule", "Vehicule", "Vehicle", "véhicule", "vehicule"])
-    col_mar  = pick_col(df, ["Marque"])
-    col_no   = pick_col(df, ["N°", "No", "N"])
-    col_des  = pick_col(df, ["Designation", "Désignation"])
-    col_qte  = pick_col(df, ["Qté", "Qte", "qte"])
-    col_mnt  = pick_col(df, ["Montant", "montant"])
-    col_tot  = pick_col(df, ["Total HTVA", "total htva", "Total"])
+    # force key columns first
+    df, _ = _force_vehicle_col(df)
+    df, _ = _force_designation_col(df)
 
-    # ints
-    for c in [col_doss, col_no]:
-        if c and c in df.columns:
+    col_doss = pick_col(df, ["N° Doss", "No Doss", "N Doss", "doss"])
+    col_veh = pick_col(df, ["Véhicule", "Vehicule", "vehicle", "immat", "immatriculation"])
+    col_mar = pick_col(df, ["Marque", "brand", "marq"])
+    col_no = pick_col(df, ["N°", "No", "N"])
+    col_des = pick_col(df, ["Designation", "Désignation", "libelle", "libellé"])
+    col_qte = pick_col(df, ["Qté", "Qte", "qte", "quantite", "quantité"])
+    col_mnt = pick_col(df, ["Montant", "mnt", "amount"])
+    col_tot = pick_col(df, ["Total HTVA", "total htva", "Total", "total htv", "total ht"])
+
+    # normalize naming to stable output
+    rename_map = {}
+    if col_doss and col_doss != "N° Doss":
+        rename_map[col_doss] = "N° Doss"
+        col_doss = "N° Doss"
+    if col_veh and col_veh != "Véhicule":
+        rename_map[col_veh] = "Véhicule"
+        col_veh = "Véhicule"
+    if col_mar and col_mar != "Marque":
+        rename_map[col_mar] = "Marque"
+        col_mar = "Marque"
+    if col_no and col_no != "N°":
+        rename_map[col_no] = "N°"
+        col_no = "N°"
+    if col_des and col_des != "Designation":
+        rename_map[col_des] = "Designation"
+        col_des = "Designation"
+    if col_qte and col_qte != "Qté":
+        rename_map[col_qte] = "Qté"
+        col_qte = "Qté"
+    if col_mnt and col_mnt != "Montant":
+        rename_map[col_mnt] = "Montant"
+        col_mnt = "Montant"
+    if col_tot and col_tot != "Total HTVA":
+        rename_map[col_tot] = "Total HTVA"
+        col_tot = "Total HTVA"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # numeric conversions
+    for c in ["N° Doss", "N°"]:
+        if c in df.columns:
             df[c] = clean_numeric(df[c]).round(0).astype("Int64")
 
-    # strings
-    for c in [col_veh, col_mar, col_des]:
-        if c and c in df.columns:
+    for c in ["Véhicule", "Marque", "Designation"]:
+        if c in df.columns:
             df[c] = df[c].fillna("").astype(str)
 
-    # Qté -> 1 decimal always
-    if col_qte and col_qte in df.columns:
-        df[col_qte] = clean_numeric(df[col_qte]).astype(float).round(1)
+    if "Qté" in df.columns:
+        df["Qté"] = clean_numeric(df["Qté"]).astype(float).round(1)
 
-    # money -> 3 decimals
-    for c in [col_mnt, col_tot]:
-        if c and c in df.columns:
+    for c in ["Montant", "Total HTVA"]:
+        if c in df.columns:
             df[c] = clean_numeric(df[c]).astype(float).round(3)
+
+    # clean vehicle id shape
+    if "Véhicule" in df.columns:
+        df["Véhicule"] = df["Véhicule"].apply(normalize_vehicle_id).astype(str)
 
     return df
 
 
 # ======================================================
-# CLEAN main/piece like your notebook (filter + normalize)
+# CLEAN common (main/piece)
 # ======================================================
 def _clean_common(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df_raw)
 
-    # normalize vehicle col name
-    if "Vehicule" in df.columns and "véhicule" not in df.columns and "Véhicule" not in df.columns:
-        df = df.rename(columns={"Vehicule": "véhicule"})
-    if "Véhicule" in df.columns and "véhicule" not in df.columns:
-        df = df.rename(columns={"Véhicule": "véhicule"})
-
-    # strip/normalize all headers (already done in normalize_cols, but keep safe)
-    df.columns = df.columns.astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
-
-    # ✅ ROBUST DROP: handles "Date", "Date ", "Date\u00A0", "indexe", etc.
-    def _norm_colname(c: str) -> str:
-        return str(c).replace("\u00A0", " ").strip().lower()
-
-    drop_set = {
-        "date",
-        "indexe",
-        "index",
-        "idx",
-        "unnamed: 0",
-        "unnamed:0",
-    }
-    to_drop = [c for c in df.columns if _norm_colname(c) in drop_set]
+    # drop junk columns by normalized name
+    drop_set = {"date", "indexe", "index", "idx", "unnamed: 0", "unnamed:0"}
+    to_drop = [c for c in df.columns if _strip_accents_txt(c) in drop_set]
     df = df.drop(columns=to_drop, errors="ignore")
 
-    # vehicle cleanup
-    if "véhicule" in df.columns:
-        df["véhicule"] = df["véhicule"].apply(normalize_vehicle_id).astype(str)
-        df = df[df["véhicule"].notna() & (df["véhicule"].str.strip() != "")]
+    # force vehicle/designation columns (mojibake-safe)
+    df, _ = _force_vehicle_col(df)
+    df, _ = _force_designation_col(df)
+
+    if "Véhicule" in df.columns:
+        df["Véhicule"] = df["Véhicule"].apply(normalize_vehicle_id).astype(str)
+        df = df[df["Véhicule"].notna() & (df["Véhicule"].str.strip() != "")]
         df = df.reset_index(drop=True)
 
     return df
@@ -239,9 +308,8 @@ def _clean_common(df_raw: pd.DataFrame) -> pd.DataFrame:
 def clean_main_df(df_main_raw: pd.DataFrame) -> pd.DataFrame:
     df = _clean_common(df_main_raw)
 
-    # filter: valid vehicle and (amount or code)
-    if "véhicule" in df.columns:
-        veh = df["véhicule"].astype(str).str.strip()
+    if "Véhicule" in df.columns:
+        veh = df["Véhicule"].astype(str).str.strip()
         is_vehicle = veh.fillna("").str.match(r"^(?:\d+-)?\d+$")
     else:
         is_vehicle = pd.Series([False] * len(df), index=df.index)
@@ -251,13 +319,10 @@ def clean_main_df(df_main_raw: pd.DataFrame) -> pd.DataFrame:
     keep = is_vehicle & (montant.notna() | code.notna())
 
     df = df.loc[keep].copy()
-
-    # enforce types/rounding
     df = enforce_schema(df)
 
-    # fix vehicle to strict format
-    if "véhicule" in df.columns:
-        df["véhicule"] = df["véhicule"].apply(normalize_vehicle_id).astype(str)
+    if "Véhicule" in df.columns:
+        df["Véhicule"] = df["Véhicule"].apply(normalize_vehicle_id).astype(str)
 
     return df.reset_index(drop=True)
 
@@ -265,9 +330,8 @@ def clean_main_df(df_main_raw: pd.DataFrame) -> pd.DataFrame:
 def clean_piece_df(df_piece_raw: pd.DataFrame) -> pd.DataFrame:
     df = _clean_common(df_piece_raw)
 
-    # filter: valid vehicle and has amount
-    if "véhicule" in df.columns:
-        veh = df["véhicule"].astype(str).str.strip()
+    if "Véhicule" in df.columns:
+        veh = df["Véhicule"].astype(str).str.strip()
         is_vehicle = veh.fillna("").str.match(r"^(?:\d+-)?\d+$")
     else:
         is_vehicle = pd.Series([False] * len(df), index=df.index)
@@ -278,14 +342,13 @@ def clean_piece_df(df_piece_raw: pd.DataFrame) -> pd.DataFrame:
     df = df.loc[keep].copy()
     df = enforce_schema(df)
 
-    if "véhicule" in df.columns:
-        df["véhicule"] = df["véhicule"].apply(normalize_vehicle_id).astype(str)
+    if "Véhicule" in df.columns:
+        df["Véhicule"] = df["Véhicule"].apply(normalize_vehicle_id).astype(str)
 
     # drop empty designation
-    des_col = pick_col(df, ["Désignation", "Designation"])
-    if des_col:
-        df[des_col] = df[des_col].astype(str).str.strip()
-        df = df[df[des_col].replace({"": np.nan, "nan": np.nan, "None": np.nan, "-": np.nan}).notna()]
+    if "Designation" in df.columns:
+        s = df["Designation"].astype(str).str.strip()
+        df = df[s.replace({"": np.nan, "nan": np.nan, "None": np.nan, "-": np.nan}).notna()].copy()
 
     return df.reset_index(drop=True)
 
@@ -296,16 +359,26 @@ def clean_piece_df(df_piece_raw: pd.DataFrame) -> pd.DataFrame:
 def build_decompte_summary(df_decompte_raw: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df_decompte_raw)
 
-    # ensure columns exist
-    for c in ["Désignation", "Total HTVA"]:
-        if c not in df.columns:
-            alt = pick_col(df, [c, c.lower(), c.replace("é", "e")])
-            if alt and alt != c:
-                df = df.rename(columns={alt: c})
-            else:
-                df[c] = pd.NA
+    # make sure we have columns
+    if "Désignation" not in df.columns and "Designation" not in df.columns:
+        # try to find anything designation-like
+        alt = pick_col(df, ["designation", "désignation"])
+        if alt:
+            df = df.rename(columns={alt: "Désignation"})
+        else:
+            df["Désignation"] = pd.NA
+    else:
+        # normalize to Désignation for parsing
+        if "Designation" in df.columns and "Désignation" not in df.columns:
+            df = df.rename(columns={"Designation": "Désignation"})
 
-    # numeric for Total HTVA
+    if "Total HTVA" not in df.columns:
+        alt = pick_col(df, ["total htva", "total htv", "total"])
+        if alt:
+            df = df.rename(columns={alt: "Total HTVA"})
+        else:
+            df["Total HTVA"] = pd.NA
+
     df["Total HTVA"] = clean_numeric(df["Total HTVA"]).astype("Float64")
 
     results = []
@@ -313,17 +386,17 @@ def build_decompte_summary(df_decompte_raw: pd.DataFrame) -> pd.DataFrame:
     current = None
 
     def contains_any(text: str, keys: List[str]) -> bool:
-        return any(k in text for k in keys)
+        return any(key in text for key in keys)
 
-    MAIN_KEYS = ["total main", "main d'oeuvre", "main doeuvre", "main dœuvre", "main d oeuvre"]
+    MAIN_KEYS = ["total main", "main d'oeuvre", "main doeuvre", "main d oeuvre"]
     PIECE_KEYS = [
         "total pieces", "total piece",
-        "total pieces de rechange", "pieces de rechange", "piece de rechange",
-        "fourniture piece", "fourniture pieces", "fournitures pieces",
-        "total fourniture", "total fournitures", "fourniture", "fournitures",
+        "pieces de rechange", "piece de rechange",
+        "fourniture piece", "fourniture pieces",
+        "total fourniture", "total fournitures",
         "pieces", "piece",
     ]
-    HTVA_KEYS = ["total htv", "total htva", "total htv/htva", "total htva/htv"]
+    HTVA_KEYS = ["total htv", "total htva", "total htv/htva"]
 
     for _, row in df.iterrows():
         des = norm_text(row.get("Désignation", ""))
@@ -332,17 +405,16 @@ def build_decompte_summary(df_decompte_raw: pd.DataFrame) -> pd.DataFrame:
             continue
         val = float(val)
 
-        # Start block
         if des.startswith("total main") or des == "total" or contains_any(des, MAIN_KEYS):
             if current is not None:
                 if current["Total HTV/HTVA"] == 0.0:
-                    current["Total HTV/HTVA"] = current["Total main d'œuvre"]
+                    current["Total HTV/HTVA"] = current["Total main d'oeuvre"]
                 results.append(current)
 
             k += 1
             current = {
                 "Decompte": f"Decompte {k}",
-                "Total main d'œuvre": val,
+                "Total main d'oeuvre": val,
                 "Total pièces": 0.0,
                 "FGB": 0.0,
                 "Total HTV/HTVA": 0.0,
@@ -352,8 +424,8 @@ def build_decompte_summary(df_decompte_raw: pd.DataFrame) -> pd.DataFrame:
         if current is None:
             continue
 
-        if (("total" in des and contains_any(des, ["piece", "pieces", "fourniture", "fournitures", "rechange"]))
-            or contains_any(des, PIECE_KEYS)):
+        if (("total" in des and contains_any(des, ["piece", "pieces", "fourniture", "rechange"]))
+                or contains_any(des, PIECE_KEYS)):
             current["Total pièces"] = val
         elif "fgb" in des:
             current["FGB"] = val
@@ -366,30 +438,29 @@ def build_decompte_summary(df_decompte_raw: pd.DataFrame) -> pd.DataFrame:
 
     if current is not None:
         if current["Total HTV/HTVA"] == 0.0:
-            current["Total HTV/HTVA"] = current["Total main d'œuvre"]
+            current["Total HTV/HTVA"] = current["Total main d'oeuvre"]
         results.append(current)
 
     summary = pd.DataFrame(results)
     if summary.empty:
         return summary
 
-    # add TOTAL GLOBAL
     summary.loc[len(summary)] = {
         "Decompte": "TOTAL GLOBAL",
-        "Total main d'œuvre": summary["Total main d'œuvre"].sum(),
+        "Total main d'oeuvre": summary["Total main d'oeuvre"].sum(),
         "Total pièces": summary["Total pièces"].sum(),
         "FGB": summary["FGB"].sum(),
         "Total HTV/HTVA": summary["Total HTV/HTVA"].sum(),
     }
 
-    for c in ["Total main d'œuvre", "Total pièces", "FGB", "Total HTV/HTVA"]:
+    for c in ["Total main d'oeuvre", "Total pièces", "FGB", "Total HTV/HTVA"]:
         summary[c] = pd.to_numeric(summary[c], errors="coerce").fillna(0.0).round(3)
 
     return summary
 
 
 # ======================================================
-# KPI builder (designation counts)
+# KPI builder
 # ======================================================
 def build_designation_kpi(df: pd.DataFrame, designation_col: str, count_col_name: str) -> pd.DataFrame:
     s = df[designation_col].apply(clean_designation_for_kpi)
@@ -398,8 +469,18 @@ def build_designation_kpi(df: pd.DataFrame, designation_col: str, count_col_name
     return out
 
 
+def designation_stats(df: pd.DataFrame, designation_col: Optional[str]) -> Tuple[int, int]:
+    if not designation_col or designation_col not in df.columns or df.empty:
+        return (0, 0)
+
+    s = df[designation_col].astype(str).str.strip()
+    s = s.replace({"": pd.NA, "nan": pd.NA, "none": pd.NA, "None": pd.NA, "-": pd.NA})
+    s = s.dropna()
+    return (int(len(s)), int(s.nunique()))
+
+
 # ======================================================
-# FINAL workbook builder (your full layout)
+# FINAL workbook builder (fixed panel layout)
 # ======================================================
 def export_brand_final_excel(
     brand: str,
@@ -407,53 +488,41 @@ def export_brand_final_excel(
     df_piece_raw: pd.DataFrame,
     df_decompte_raw: pd.DataFrame,
 ) -> bytes:
-    # -------- clean ----------
     df_main = clean_main_df(df_main_raw)
     df_piece = clean_piece_df(df_piece_raw)
 
-    # unify headers for export workbook (use Véhicule + Designation consistently)
-    rename_map = {
-        "véhicule": "Véhicule",
-        "Vehicule": "Véhicule",
-        "Désignation": "Designation",
-        "designation": "Designation",
-    }
-    df_main = df_main.rename(columns=rename_map)
-    df_piece = df_piece.rename(columns=rename_map)
+    # force stable col names again (safety)
+    df_main, _ = _force_vehicle_col(df_main)
+    df_piece, _ = _force_vehicle_col(df_piece)
+    df_main, _ = _force_designation_col(df_main)
+    df_piece, _ = _force_designation_col(df_piece)
 
-    # safety: fix vehicles again using permissive fix then drop invalid
-    veh_main_col = pick_col(df_main, ["Véhicule"])
-    veh_piece_col = pick_col(df_piece, ["Véhicule"])
-    if veh_main_col:
-        df_main[veh_main_col] = df_main[veh_main_col].apply(fix_vehicle)
-        df_main = df_main.dropna(subset=[veh_main_col])
-    if veh_piece_col:
-        df_piece[veh_piece_col] = df_piece[veh_piece_col].apply(fix_vehicle)
-        df_piece = df_piece.dropna(subset=[veh_piece_col])
+    if "Véhicule" in df_main.columns:
+        df_main["Véhicule"] = df_main["Véhicule"].apply(fix_vehicle)
+        df_main = df_main.dropna(subset=["Véhicule"])
+    if "Véhicule" in df_piece.columns:
+        df_piece["Véhicule"] = df_piece["Véhicule"].apply(fix_vehicle)
+        df_piece = df_piece.dropna(subset=["Véhicule"])
 
-    # add Type + combine
-    df_main["Type"] = "Main d'œuvre"
+    df_main["Type"] = "Main d'oeuvre"
     df_piece["Type"] = "Pièce"
     full_df = pd.concat([df_main, df_piece], ignore_index=True)
     full_df = enforce_schema(full_df)
 
-    # columns
-    veh_col = pick_col(full_df, ["Véhicule"])
-    total_col = pick_col(full_df, ["Total HTVA", "Total"])
+    # Required columns (now should exist)
+    veh_col = pick_col(full_df, ["Véhicule", "Vehicule", "vehicle"])
+    total_col = pick_col(full_df, ["Total HTVA", "total htva", "total"])
+    if veh_col is None:
+        raise ValueError(f"Vehicle column not found after cleaning. Columns are: {list(full_df.columns)}")
+    if total_col is None:
+        raise ValueError(f"Total column not found after cleaning. Columns are: {list(full_df.columns)}")
+
     des_col = pick_col(full_df, ["Designation"])
     qte_col = pick_col(full_df, ["Qté", "Qte", "qte"])
-    mnt_col = pick_col(full_df, ["Montant", "montant"])
-    doss_col = pick_col(full_df, ["N° Doss", "N°Doss", "No Doss", "N Doss"])
+    mnt_col = pick_col(full_df, ["Montant"])
+    doss_col = pick_col(full_df, ["N° Doss", "doss"])
     no_col = pick_col(full_df, ["N°", "No", "N"])
 
-    if veh_col is None:
-        raise ValueError("Vehicle column not found after cleaning.")
-    if total_col is None:
-        raise ValueError("Total column not found after cleaning.")
-    if des_col is None:
-        des_col = None
-
-    # decompte summary + totals
     df_decompte_sum = build_decompte_summary(df_decompte_raw)
 
     decompte_total = 0.0
@@ -464,7 +533,6 @@ def export_brand_final_excel(
             decompte_total = safe_float(df_decompte_sum.loc[mask_total, "Total HTV/HTVA"].iloc[0])
             fgb_global = safe_float(df_decompte_sum.loc[mask_total, "FGB"].iloc[0])
 
-    # KPI (designation counts)
     df_kpi_main = pd.DataFrame()
     df_kpi_piece = pd.DataFrame()
     if "Designation" in df_main.columns:
@@ -472,11 +540,10 @@ def export_brand_final_excel(
     if "Designation" in df_piece.columns:
         df_kpi_piece = build_designation_kpi(df_piece, "Designation", "Piece Count")
 
-    # -------- workbook ----------
     bio = BytesIO()
     wb = xlsxwriter.Workbook(bio, {"in_memory": True, "nan_inf_to_errors": True})
 
-    header_fmt = wb.add_format({"bold": True, "align": "center", "border": 1, "bg_color": "#2F5597", "font_color": "white"})
+    header_fmt = wb.add_format({"bold": True, "align": "center", "border": 1, "bg_color": "#1F4E79", "font_color": "white"})
     link_fmt = wb.add_format({"font_color": "blue", "underline": 1})
     cell_fmt = wb.add_format({"border": 1})
     int_fmt = wb.add_format({"border": 1, "num_format": "0"})
@@ -484,10 +551,9 @@ def export_brand_final_excel(
     money_fmt = wb.add_format({"border": 1, "num_format": "0.000"})
     total_fmt = wb.add_format({"bold": True, "border": 1, "bg_color": "#C6E0B4", "num_format": "0.000"})
     section_title_fmt = wb.add_format({"bold": True, "align": "left", "valign": "vcenter"})
-    remarque_fmt = wb.add_format({"bold": True, "align": "left", "valign": "vcenter", "border": 1, "bg_color": "#C6E0B4", "text_wrap": True})
 
     def get_fmt_for_col(col_name: str):
-        c = str(col_name).lower().strip()
+        c = _strip_accents_txt(col_name)
         if "doss" in c:
             return int_fmt
         if c in ["n°", "no", "n"]:
@@ -498,7 +564,6 @@ def export_brand_final_excel(
             return money_fmt
         return cell_fmt
 
-    # Vehicle List sheet
     summary_name = f"{brand} Vehicle List"[:31]
     summary_ws = wb.add_worksheet(summary_name)
     summary_ws.write_row(0, 0, ["Véhicule ID", "Total HTVA", "Open"], header_fmt)
@@ -580,14 +645,31 @@ def export_brand_final_excel(
 
             row_cursor += 2
 
-        write_block("Main d'œuvre", df_main_part)
+        write_block("Main d'oeuvre", df_main_part)
         write_block("Pièce", df_piece_part)
+
+        # ✅ FIX: panel always at K:L (0-based col 10 and 11)
+        if des_col is not None and des_col in df_veh.columns:
+            _, main_unique = designation_stats(df_main_part, des_col)
+            _, piece_unique = designation_stats(df_piece_part, des_col)
+
+            panel_col = 10  # K
+            panel_row = 2
+            ws.merge_range(panel_row, panel_col, panel_row, panel_col + 1, "Designation Stats", header_fmt)
+            items = [("Main d'oeuvre", main_unique), ("Pièces", piece_unique)]
+            for j, (label, val) in enumerate(items, start=1):
+                ws.write(panel_row + j, panel_col, label, cell_fmt)
+                ws.write_number(panel_row + j, panel_col + 1, int(val), int_fmt)
+            ws.set_column(panel_col, panel_col, 22)
+            ws.set_column(panel_col + 1, panel_col + 1, 10)
 
         ws.write(row_cursor, 0, "Total HTVA", section_title_fmt)
         ws.write_number(row_cursor, 1, veh_total, total_fmt)
-        ws.set_column(0, len(show_cols) - 1, 18)
 
-    # Summary totals section
+        # A..H readable
+        ws.set_column(0, max(len(show_cols) - 1, 7), 18)
+
+    # ===== Summary totals
     last = len(vehicules) + 2
     summary_ws.write(last, 0, "TOTAL of VEHICLES", header_fmt)
     summary_ws.write_number(last, 1, round(total_vehicles, 3), total_fmt)
@@ -598,39 +680,31 @@ def export_brand_final_excel(
     summary_ws.write(last + 2, 0, f"TOTAL Décompte {brand}", header_fmt)
     summary_ws.write_number(last + 2, 1, round(safe_float(decompte_total), 3), total_fmt)
 
-    # Links row: Missing HTVA
+    # ===== Missing sheet + KPI sheet links
     missing_sheet = "Missing HTVA"
     missing_row = last + 3
     summary_ws.write(missing_row, 0, "Missing data", header_fmt)
     summary_ws.write_blank(missing_row, 1, None, total_fmt)
     summary_ws.write_url(missing_row, 2, f"internal:'{missing_sheet}'!A1", link_fmt, string="Go to Missing HTVA")
 
-    # KPI links
     design_main_sheet = "Designation Count - Main"
     design_piece_sheet = "Designation Count - Piece"
 
-    summary_ws.write(missing_row + 1, 0, "Designation Count - Main d'œuvre", header_fmt)
+    summary_ws.write(missing_row + 1, 0, "Designation Count - Main d'oeuvre", header_fmt)
     summary_ws.write_blank(missing_row + 1, 1, None, total_fmt)
-    summary_ws.write_url(missing_row + 1, 2, f"internal:'{design_main_sheet}'!A1", link_fmt, string="Go to Main d'oeuvre")
+    summary_ws.write_url(missing_row + 1, 2, f"internal:'{design_main_sheet}'!A1", link_fmt, string="Go to Main")
 
     summary_ws.write(missing_row + 2, 0, "Designation Count - Pièce", header_fmt)
     summary_ws.write_blank(missing_row + 2, 1, None, total_fmt)
     summary_ws.write_url(missing_row + 2, 2, f"internal:'{design_piece_sheet}'!A1", link_fmt, string="Go to Pièce")
 
-    # Remarque block
-    summary_ws.write(missing_row + 3, 0, "Remarque :", remarque_fmt)
-    summary_ws.write(missing_row + 3, 1, f"TOTAL Décompte {brand} = TOTAL des VEHICULES + FGB", remarque_fmt)
-    summary_ws.write(missing_row + 4, 0, "Valeur FGB :", remarque_fmt)
-    summary_ws.write(missing_row + 4, 1, "Différence entre TOTAL Décompte et TOTAL des VEHICULES", remarque_fmt)
-
     summary_ws.set_column("A:A", 35)
-    summary_ws.set_column("B:B", 35)
+    summary_ws.set_column("B:B", 20)
     summary_ws.set_column("C:C", 20)
 
-    # Missing HTVA sheet
+    # ===== Missing HTVA sheet
     miss_ws = wb.add_worksheet(missing_sheet)
     miss_ws.write_url(0, 0, f"internal:'{summary_name}'!A1", link_fmt, string="Back To List")
-
     miss_headers = ["Véhicule", "Type", "Excel Row", "N° Doss", "N°", "Designation", "Qté", "Montant", "Total HTVA", "Open"]
     miss_ws.write_row(2, 0, miss_headers, header_fmt)
 
@@ -661,15 +735,7 @@ def export_brand_final_excel(
     else:
         miss_ws.write(3, 0, "✅ No lines with Total HTVA = 0.000 found.", cell_fmt)
 
-    miss_ws.set_column("A:A", 14)
-    miss_ws.set_column("B:B", 12)
-    miss_ws.set_column("C:C", 10)
-    miss_ws.set_column("D:E", 10)
-    miss_ws.set_column("F:F", 45)
-    miss_ws.set_column("G:I", 12)
-    miss_ws.set_column("J:J", 12)
-
-    # KPI sheets
+    # ===== KPI sheets
     main_kpi_ws = wb.add_worksheet(design_main_sheet[:31])
     main_kpi_ws.write_url(0, 0, f"internal:'{summary_name}'!A1", link_fmt, string="Back To List")
     main_kpi_ws.write_row(2, 0, ["Designation", "Main Count"], header_fmt)
@@ -690,14 +756,17 @@ def export_brand_final_excel(
     piece_kpi_ws.set_column("A:A", 60)
     piece_kpi_ws.set_column("B:B", 18)
 
-    # Decompte sheet (summary)
+    # ===== Decompte sheet
     decompte_name = f"Decompte {brand}"[:31]
     de_ws = wb.add_worksheet(decompte_name)
+    de_ws.write_url(0, 0, f"internal:'{summary_name}'!A1", link_fmt, string="Back To List")
+
+    start_row = 2
     if df_decompte_sum is None or df_decompte_sum.empty:
-        de_ws.write(0, 0, "No decompte summary", header_fmt)
+        de_ws.write(start_row, 0, "No decompte summary", header_fmt)
     else:
-        de_ws.write_row(0, 0, df_decompte_sum.columns.tolist(), header_fmt)
-        for r, rec in enumerate(df_decompte_sum.itertuples(index=False, name=None), start=1):
+        de_ws.write_row(start_row, 0, df_decompte_sum.columns.tolist(), header_fmt)
+        for r, rec in enumerate(df_decompte_sum.itertuples(index=False, name=None), start=start_row + 1):
             for c, val in enumerate(rec):
                 if isinstance(val, (int, np.integer)):
                     de_ws.write_number(r, c, int(val), int_fmt)
@@ -707,7 +776,6 @@ def export_brand_final_excel(
                     de_ws.write(r, c, "" if val is None else val, cell_fmt)
         de_ws.set_column("A:E", 20)
 
-    # link from summary to decompte
     summary_ws.write_url(last + 2, 2, f"internal:'{decompte_name}'!A1", link_fmt, string="Go to Decompte")
 
     wb.close()

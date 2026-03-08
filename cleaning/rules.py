@@ -1,12 +1,12 @@
+#rules.py
+
 import numpy as np
 import pandas as pd
-
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
-
 
 def safe_float(x):
     try:
@@ -18,7 +18,6 @@ def safe_float(x):
         return v
     except Exception:
         return 0.0
-
 
 def find_col(df: pd.DataFrame, candidates):
     cols = {str(c).lower().strip(): c for c in df.columns}
@@ -33,7 +32,6 @@ def find_col(df: pd.DataFrame, candidates):
         if any(k.lower() in lc for k in candidates):
             return c
     return None
-
 
 def count_designations(df: pd.DataFrame) -> int:
     col = find_col(df, ["designation", "désignation", "libelle", "libellé"])

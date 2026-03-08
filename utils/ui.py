@@ -98,3 +98,4 @@ def card_open():
 
 def card_close():
     st.markdown("</div>", unsafe_allow_html=True)
+
